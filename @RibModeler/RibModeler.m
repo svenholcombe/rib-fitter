@@ -508,4 +508,136 @@ classdef RibModeler < RibParameterFitterNorm
                 'Color',pSpiH.Color)
         end
     end
+    
+    
+    methods
+        %% PLANE fitting
+        function [PHLTBH_rad, PHLTBH_ROT_matrix] = getPlaneRotationParameters(~, ribPlane, ribSide)
+            % ribPlane is a 1-by-9 PLANE vector in geom3d package format.
+            % This means that ribPlane(4:6) give the unit vector direction
+            % of the rib's local X-axis, and ribPlane(7:9) the unit vector
+            % direction of the rib's local Y-axis.
+            % ribSide is +1 for left, -1 for right-sided ribs.
+            if ischar(ribSide) || isstring(ribSide)
+                ribSide = sign((ribSide=="L") - 0.5);
+            end
+            
+            % Now we can measure the PH and LT angles directly:
+            [theta,phi] = cart2sph(ribSide * ribPlane(4),ribPlane(5),ribPlane(6));
+            % Phi is the elevation. It should be slightly negative for ribs "hanging"
+            % just below the horizon. We need to add 90 degrees to get it measured from
+            % the inferior direction upwards.
+            PH_rad = pi/2 + phi;
+            % Theta is the azimuth, measured positively from the X-axis (lateral left).
+            % Since we have multiplied the rib plane axis's X value by the ribside,
+            % both sided ribs will be pointing in this +ve X direction. Perfectly
+            % laterally pointing ribs will have THETA=0deg, and perfectly anteriorly
+            % pointing ribs will have THETA=-90deg. We need to add 90deg to get the LT
+            % angle from the anterior direction subtended laterally.
+            LS_rad = pi/2 + theta;
+            
+            % The initial rib position is this:
+            %  - The primary axis (prox pt to dist pt) points INFERIORLY [0 0 -1]
+            ribInitialPosXVec = [0 0 -1];
+            %  - The secondary axis (+Y local in-plane direction) points LATERALLY
+            ribInitialPosYVec = [ribSide 0 0];
+            %  - The tertiary axis (out-of-local-plane) is resultant (anterior for left ribs, posterior for right ribs)
+            % [not needed] ribInitialPosZVec = cross(ribInitialPosXVec, ribInitialPosYVec); % Or: [0 -ribSide 0];
+            
+            % Pump-handle rotation is around -X axis (ie, +ve rotation brings ribs up)
+            PHrotationAxisGlo = [-1 0 0];
+            % Lat-twist rotation is around the sup/inf axis for left/right ribs (ie,
+            % +ve rotation brings ribs from the medial plane laterally.
+            LTrotationAxisGlo = [ 0 0 ribSide];
+            % Next, the initial rib X-axis is rotated by PH and LT. The newly rotated
+            % rib X direction defines a local axis about which to apply the BH rotation
+            PH_ROT = createRotation3dLineAngle([0 0 0 PHrotationAxisGlo], PH_rad);
+            LS_ROT = createRotation3dLineAngle([0 0 0 LTrotationAxisGlo], LS_rad);
+            PH_then_LS_ROT = composeTransforms3d(PH_ROT, LS_ROT);
+            ribInitXVecAfterPH_LT = transformPoint3d(ribInitialPosXVec, PH_then_LS_ROT);
+            
+            % If we take the initial Y-vector of the rib (ie, purely lateral unit vec),
+            % then apply the PH and LT transformations, we will get a unit vector
+            % purely in-plane to an axial plane. The angle between this unit vector and
+            % the ribPlane Y-vector will be the bucket handle angle. This can be
+            % extracted by the acos of the dot product of these two vectors:
+            ribInitYVecAfterPH_LS = transformPoint3d(ribInitialPosYVec, PH_then_LS_ROT);
+            BH_rad = acos(sum(ribInitYVecAfterPH_LS .* ribPlane(7:9)));
+            
+            % This angle will be unsigned. However, if we take the ribPlane's Z
+            % direction vector and multiply it by ribSide, we will get the out-of-plane
+            % direction always pointing "superiorly", or towards the top of the
+            % ribcage.
+            ribPlaneZvec = cross(ribPlane(4:6), ribPlane(7:9)) * ribSide;
+            
+            % If the dot product of these two vectors is positive, it means the rotated
+            % rib Y axis was pointing *above* the true rib XY plane, and the BH angle
+            % should be reversed to reflect that the rib should be rotated DOWN by BH
+            % to meet the true rib plane.
+            if sum(ribInitYVecAfterPH_LS .* ribPlaneZvec) > 0
+                BH_rad = -BH_rad;
+            end
+            
+            % Pack the rotation angles together.
+            PHLTBH_rad = [PH_rad LS_rad BH_rad];
+            
+            % To provide a rotation matrix for the complete transform, we must ensure
+            % that the lateral tips of ribs move SUPERIORLY under +ve BH rotation, and
+            % INFERIORLY under -ve BH rotation. This means we need to reverse the rib
+            % primary axis on right sided ribs (so that it points distal-to-proximal).
+            ribInitXVecAfterPH_LT = ribInitXVecAfterPH_LT * ribSide;
+            PHLTBH_ROT_matrix = composeTransforms3d(PH_ROT, LS_ROT, createRotation3dLineAngle([0 0 0 ribInitXVecAfterPH_LT], BH_rad));
+        end
+        
+        function globalPtsInSitu = transformLocalRibPointsToInSitu(~, localPtsInPlane, PH_LS_BH_ROT, ribSide)
+            % First we must interpret the localRibPts (X pointing proximal
+            % to distal, Y pointing laterally, Z resultant) as if they're
+            % actually placed with the rib pointing down with lateral to
+            % the lateral and "superior aspect of rib" pointing anteriorly
+            localPtsInSituXYZ = bsxfun(@times, localPtsInPlane(:,[2 3 1]), [ribSide -ribSide -1]); 
+            % Now we can apply the transformation matrix to rotate them up
+            % to the correct global orientation
+            % globalPtsInSitu = transformPoint3d(localPtsInSituXYZ,PH_LS_BH_ROT);
+            % [faster version w/o error checking of line above is below] 
+            globalPtsInSitu = localPtsInSituXYZ * PH_LS_BH_ROT(1:3,1:3)';
+        end
+        
+        function PH_LS_BH_ROT = createRibLocalToGlobalTransform_deg(this,PH_deg,LS_deg,BH_deg,ribSide)
+            % Rotation angles must be given in degrees
+            PH_LS_BH_ROT = this.createRibLocalToGlobalTransform_rad(...
+                deg2rad(PH_deg),deg2rad(LS_deg),deg2rad(BH_deg),ribSide);
+        end
+        
+        function PH_LS_BH_ROT = createRibLocalToGlobalTransform_rad(~,PH_rad,LS_rad,BH_rad,ribSide)
+            % Rotation angles must be given in radians
+
+            % First pump-handle rotation and lateral torsion rotation about
+            % axes defined with respect to the initial rib position
+            % PHrotationAxisGlo = [-1 0 0];
+            % PH_ROT = createRotation3dLineAngle([0 0 0 PHrotationAxisGlo], PH_rad);
+            % [faster version w/o error checking of lines above is below] 
+            cmPH = cos(-PH_rad); % Cos of MINUS PH because we're rotating about -X axis
+            smPH = sin(-PH_rad); % Sin of MINUS PH because we're rotating about -X axis
+            PH_ROT = [1 0 0 0; 0 cmPH -smPH 0; 0 smPH cmPH 0; 0 0 0 1];
+            % LSrotationAxisGlo = [ 0 0 ribSide];
+            % LS_ROT = createRotation3dLineAngle([0 0 0 LSrotationAxisGlo], LS_rad);
+            % [faster version w/o error checking of lines above is below] 
+            cLS = cos(LS_rad * ribSide);
+            sLS = sin(LS_rad * ribSide);
+            LS_ROT = [cLS -sLS 0 0; sLS cLS 0 0; 0 0 1 0; 0 0 0 1];
+            
+            % Next rotate the rib by PH and LT. The newly rotated rib X
+            % direction defines a local axis about which to apply the BH
+            % rotation
+            ribInitialPosXVec = [0 0 -1]; % The rib primary axis is initially pointing to the feet
+            PH_then_LS_ROT = composeTransforms3d(PH_ROT, LS_ROT);
+            ribAxisAfterPH_LS = transformPoint3d(ribInitialPosXVec, PH_then_LS_ROT);
+            
+            % The BH rotation will be +ve for left sided ribs, -ve for right sided
+            BH_ROT = createRotation3dLineAngle([0 0 0 ribAxisAfterPH_LS], BH_rad * ribSide);
+            
+            PH_LS_BH_ROT = composeTransforms3d(PH_ROT, LS_ROT, BH_ROT);
+        end
+        
+    end
 end
