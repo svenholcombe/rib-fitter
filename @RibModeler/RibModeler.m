@@ -512,7 +512,17 @@ classdef RibModeler < RibParameterFitterNorm
     
     methods
         %% PLANE fitting
-        function [PHLTBH_rad, PHLTBH_ROT_matrix] = getPlaneRotationParameters(~, ribPlane, ribSide)
+        function [PHLTBH_rad, PHLTBH_ROT_matrix] = getPlaneRotationParameters(~, ribPlane, ribSide,opts)
+            arguments
+                ~
+                ribPlane
+                ribSide
+                % Pump-handle rotation is around -X axis (ie, +ve rotation brings ribs up)
+                opts.PHrotationAxisGlo = [-1 0 0];
+                
+                opts.LTrotationAxisGlo = [0 0 1]; % Will be multiplied by ribSide (-ve on right)
+                
+            end
             % ribPlane is a 1-by-9 PLANE vector in geom3d package format.
             % This means that ribPlane(4:6) give the unit vector direction
             % of the rib's local X-axis, and ribPlane(7:9) the unit vector
@@ -545,10 +555,10 @@ classdef RibModeler < RibParameterFitterNorm
             % [not needed] ribInitialPosZVec = cross(ribInitialPosXVec, ribInitialPosYVec); % Or: [0 -ribSide 0];
             
             % Pump-handle rotation is around -X axis (ie, +ve rotation brings ribs up)
-            PHrotationAxisGlo = [-1 0 0];
+            PHrotationAxisGlo = opts.PHrotationAxisGlo;
             % Lat-twist rotation is around the sup/inf axis for left/right ribs (ie,
             % +ve rotation brings ribs from the medial plane laterally.
-            LTrotationAxisGlo = [ 0 0 ribSide];
+            LTrotationAxisGlo = opts.LTrotationAxisGlo * ribSide;
             % Next, the initial rib X-axis is rotated by PH and LT. The newly rotated
             % rib X direction defines a local axis about which to apply the BH rotation
             PH_ROT = createRotation3dLineAngle([0 0 0 PHrotationAxisGlo], PH_rad);
@@ -589,17 +599,16 @@ classdef RibModeler < RibParameterFitterNorm
             PHLTBH_ROT_matrix = composeTransforms3d(PH_ROT, LS_ROT, createRotation3dLineAngle([0 0 0 ribInitXVecAfterPH_LT], BH_rad));
         end
         
-        function globalPtsInSitu = transformLocalRibPointsToInSitu(~, localPtsInPlane, PH_LS_BH_ROT, ribSide)
+        function [globalPtsInSitu,TF] = transformLocalRibPointsToInSitu(RM, localPtsInPlane, PH_LS_BH_ROT, ribSide)
             % First we must interpret the localRibPts (X pointing proximal
             % to distal, Y pointing laterally, Z resultant) as if they're
             % actually placed with the rib pointing down with lateral to
             % the lateral and "superior aspect of rib" pointing anteriorly
-            localPtsInSituXYZ = bsxfun(@times, localPtsInPlane(:,[2 3 1]), [ribSide -ribSide -1]); 
-            % Now we can apply the transformation matrix to rotate them up
-            % to the correct global orientation
-            % globalPtsInSitu = transformPoint3d(localPtsInSituXYZ,PH_LS_BH_ROT);
-            % [faster version w/o error checking of line above is below] 
-            globalPtsInSitu = localPtsInSituXYZ * PH_LS_BH_ROT(1:3,1:3)';
+            if ischar(ribSide) || isstring(ribSide) % convention: +ve left, -ve right
+                ribSide = sign((ribSide=="L") - 0.5);
+            end
+            TF = RM.getLocalToHangingCsysRotMat(PH_LS_BH_ROT,ribSide);
+            globalPtsInSitu = TF.transformPointsForward(localPtsInPlane);
         end
         
         function PH_LS_BH_ROT = createRibLocalToGlobalTransform_deg(this,PH_deg,LS_deg,BH_deg,ribSide)
@@ -610,7 +619,11 @@ classdef RibModeler < RibParameterFitterNorm
         
         function PH_LS_BH_ROT = createRibLocalToGlobalTransform_rad(~,PH_rad,LS_rad,BH_rad,ribSide)
             % Rotation angles must be given in radians
-
+            
+            if ischar(ribSide) || isstring(ribSide) % convention: +ve left, -ve right
+                ribSide = sign((ribSide=="L") - 0.5);
+            end
+            
             % First pump-handle rotation and lateral torsion rotation about
             % axes defined with respect to the initial rib position
             % PHrotationAxisGlo = [-1 0 0];
@@ -639,5 +652,22 @@ classdef RibModeler < RibParameterFitterNorm
             PH_LS_BH_ROT = composeTransforms3d(PH_ROT, LS_ROT, BH_ROT);
         end
         
+    end
+    methods (Static)
+        function TF = getLocalToHangingCsysRotMat(PH_LS_BH_ROT,ribSide)
+            % First we must interpret the localRibPts (X pointing proximal
+            % to distal, Y pointing laterally, Z resultant) as if they're
+            % actually placed with the rib pointing down with lateral to
+            % the lateral and "superior aspect of rib" pointing anteriorly
+            if ischar(ribSide) || isstring(ribSide) % convention: +ve left, -ve right
+                ribSide = sign((ribSide=="L") - 0.5);
+            end
+            localRibToHangingMedCsys = [
+                0 ribSide        0 0;   % Global X comes from local Y
+                0       0 -ribSide 0;   % Global Y comes from local Z
+                -1      0        0 0;   % Global Z comes from negative local X
+                0       0        0 1];
+            TF = affine3d(localRibToHangingMedCsys' * PH_LS_BH_ROT');
+        end
     end
 end
